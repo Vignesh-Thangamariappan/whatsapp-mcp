@@ -8,4 +8,8 @@ dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.6.0",
     "requests>=2.32.3",
+    # Pinned up from transitive versions locked with known CVEs (h11 request
+    # smuggling below 0.16.0, urllib3 redirect handling below 2.5.0).
+    "h11>=0.16.0",
+    "urllib3>=2.5.0",
 ]

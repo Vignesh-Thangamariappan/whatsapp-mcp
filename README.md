@@ -14,6 +14,20 @@ Here's an example of what you can do when it's connected to Claude.
 
 > *Caution:* as with many MCP servers, the WhatsApp MCP is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). This means that project injection could lead to private data exfiltration.
 
+## Security fixes in this fork
+
+This fork closes several issues found in a security audit of upstream `lharries/whatsapp-mcp` (matching upstream issues [#241](https://github.com/lharries/whatsapp-mcp/issues/241), [#215](https://github.com/lharries/whatsapp-mcp/issues/215), and the [Invariant Labs writeup](https://invariantlabs.ai/blog/whatsapp-mcp-exploited) referenced in [#42](https://github.com/lharries/whatsapp-mcp/issues/42)):
+
+- **Path traversal in `download_media`** — a document's filename (attacker-controlled, set by whoever sends you the file) could contain `../` sequences and write outside the intended `store/<chat>/` directory. Filenames are now sanitized with `filepath.Base` plus a containment check.
+- **Bridge REST API was unauthenticated and bound to all interfaces** (`0.0.0.0:8080`) — anyone on the same LAN could send messages or pull media as you. The bridge now binds to `127.0.0.1` by default and requires a bearer token on every request. The token is auto-generated on first run, persisted to `whatsapp-bridge/store/api_token.txt` (mode `0600`), and read automatically by the Python MCP server — no setup needed unless you run the two processes on different machines, in which case set `WHATSAPP_BRIDGE_TOKEN` (and `WHATSAPP_BRIDGE_HOST` if you intentionally want to expose the port) as matching env vars on both sides.
+- **SQL `LIKE` search terms weren't escaped** — a `%` or `_` in a search query could match more (or different) rows than intended in contact/chat search. Wildcards are now escaped.
+- **Stricter file permissions** — `store/` and downloaded media are now created `0700`/`0600` instead of `0755`/`0644`, so other local accounts on a shared machine can't read your session keys or message history.
+- **Reduced logging of message content** — plaintext message bodies and the media upload response (which includes the decryption key) are no longer printed/logged; only metadata (length, media type, timestamps) is.
+- **Temp file cleanup** — converted `.ogg` voice-message temp files are now deleted after sending instead of accumulating in `/tmp`.
+- **Bumped `h11` and `urllib3`** to versions past known CVEs.
+
+Not fixed here (design-level, not a bug): `send_file`/`send_audio_message` still accept any absolute local path, and incoming message/group-chat text still reaches the LLM unmarked as untrusted. Both are inherent to how this MCP works today — see the lethal-trifecta caution above. Treat any WhatsApp content (messages, group names, contact names) as untrusted input when writing prompts or automations against this server.
+
 ## Installation
 
 ### Prerequisites

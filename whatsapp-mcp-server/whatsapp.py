@@ -8,7 +8,33 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+API_TOKEN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'api_token.txt')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+
+
+def _get_api_token() -> Optional[str]:
+    """Read the bridge's shared-secret API token: env var first, then the file the
+    bridge itself persists to (store/api_token.txt) if it auto-generated one."""
+    token = os.environ.get("WHATSAPP_BRIDGE_TOKEN")
+    if token:
+        return token
+    try:
+        with open(API_TOKEN_PATH, "r") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def _auth_headers() -> dict:
+    token = _get_api_token()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def _escape_like(value: str) -> str:
+    """Escape SQL LIKE wildcards (%, _) so user search terms are matched literally
+    instead of as patterns - otherwise a query containing '%' or '_' can match far
+    more (or different) rows than the caller intended."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 @dataclass
 class Message:
@@ -73,9 +99,9 @@ def get_sender_name(sender_jid: str) -> str:
             cursor.execute("""
                 SELECT name
                 FROM chats
-                WHERE jid LIKE ?
+                WHERE jid LIKE ? ESCAPE '\\'
                 LIMIT 1
-            """, (f"%{phone_part}%",))
+            """, (f"%{_escape_like(phone_part)}%",))
             
             result = cursor.fetchone()
         
@@ -172,8 +198,8 @@ def list_messages(
             params.append(chat_jid)
             
         if query:
-            where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
-            params.append(f"%{query}%")
+            where_clauses.append("LOWER(messages.content) LIKE LOWER(?) ESCAPE '\\'")
+            params.append(f"%{_escape_like(query)}%")
             
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
@@ -350,8 +376,9 @@ def list_chats(
         params = []
         
         if query:
-            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
-            params.extend([f"%{query}%", f"%{query}%"])
+            escaped_query = _escape_like(query)
+            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) ESCAPE '\\' OR chats.jid LIKE ? ESCAPE '\\')")
+            params.extend([f"%{escaped_query}%", f"%{escaped_query}%"])
             
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
@@ -397,15 +424,15 @@ def search_contacts(query: str) -> List[Contact]:
         cursor = conn.cursor()
         
         # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+        search_pattern = '%' + _escape_like(query) + '%'
+
         cursor.execute("""
-            SELECT DISTINCT 
+            SELECT DISTINCT
                 jid,
                 name
             FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+            WHERE
+                (LOWER(name) LIKE LOWER(?) ESCAPE '\\' OR LOWER(jid) LIKE LOWER(?) ESCAPE '\\')
                 AND jid NOT LIKE '%@g.us'
             ORDER BY name, jid
             LIMIT 50
@@ -597,9 +624,9 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             FROM chats c
             LEFT JOIN messages m ON c.jid = m.chat_jid 
                 AND c.last_message_time = m.timestamp
-            WHERE c.jid LIKE ? AND c.jid NOT LIKE '%@g.us'
+            WHERE c.jid LIKE ? ESCAPE '\\' AND c.jid NOT LIKE '%@g.us'
             LIMIT 1
-        """, (f"%{sender_phone_number}%",))
+        """, (f"%{_escape_like(sender_phone_number)}%",))
         
         chat_data = cursor.fetchone()
         
@@ -634,7 +661,7 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             "message": message,
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_auth_headers())
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -668,7 +695,7 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             "media_path": media_path
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_auth_headers())
         
         # Check if the request was successful
         if response.status_code == 200:
@@ -685,44 +712,54 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
         return False, f"Unexpected error: {str(e)}"
 
 def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
+    converted_temp_path = None
     try:
         # Validate input
         if not recipient:
             return False, "Recipient must be provided"
-        
+
         if not media_path:
             return False, "Media path must be provided"
-        
+
         if not os.path.isfile(media_path):
             return False, f"Media file not found: {media_path}"
 
         if not media_path.endswith(".ogg"):
             try:
                 media_path = audio.convert_to_opus_ogg_temp(media_path)
+                converted_temp_path = media_path
             except Exception as e:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
-        
+
         url = f"{WHATSAPP_API_BASE_URL}/send"
         payload = {
             "recipient": recipient,
             "media_path": media_path
         }
-        
-        response = requests.post(url, json=payload)
-        
+
+        response = requests.post(url, json=payload, headers=_auth_headers())
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+    finally:
+        # convert_to_opus_ogg_temp creates the file with delete=False, so it's never
+        # otherwise cleaned up - every non-ogg voice message left a stray temp file.
+        if converted_temp_path and os.path.exists(converted_temp_path):
+            try:
+                os.unlink(converted_temp_path)
+            except OSError:
+                pass
 
 def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     """Download media from a message and return the local file path.
@@ -741,7 +778,7 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "chat_jid": chat_jid
         }
         
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, headers=_auth_headers())
         
         if response.status_code == 200:
             result = response.json()
