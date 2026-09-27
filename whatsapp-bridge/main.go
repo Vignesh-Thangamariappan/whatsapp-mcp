@@ -236,6 +236,19 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		// media_path accepts any absolute path by design (that's the whole point of
+		// send_file/send_audio_message), but that means an LLM tricked by a prompt
+		// injection inside a WhatsApp message could point it at the bridge's own
+		// session DB and exfiltrate it via WhatsApp to take over the account. Block
+		// just the bridge's own top-level store files (whatsapp.db, messages.db,
+		// api_token.txt); per-chat subdirectories still work, so re-sending media
+		// you already downloaded from a chat is unaffected.
+		if blocked, err := isBlockedStorePath(mediaPath); err != nil {
+			return false, fmt.Sprintf("Error validating media path: %v", err)
+		} else if blocked {
+			return false, "Refusing to send a file from the bridge's own store directory (session keys / API token live there)"
+		}
+
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
@@ -594,8 +607,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// document messages comes from the sender (doc.GetFileName()) and is otherwise
 	// attacker-controlled - without this, a crafted filename like "../../../.ssh/authorized_keys"
 	// would let anyone who messages the account write files outside chatDir (CWE-22).
+	// filepath.Base strips any path separators, but ".." itself contains none and
+	// still means "parent directory", so it has to be rejected explicitly.
 	filename = filepath.Base(filepath.Clean(filename))
-	if filename == "" || filename == "." || filename == "/" || filename == string(filepath.Separator) {
+	if filename == "" || filename == "." || filename == ".." || filename == "/" || filename == string(filepath.Separator) {
 		filename = "file_" + time.Now().Format("20060102_150405")
 	}
 
@@ -613,13 +628,15 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
 	}
 
-	// Defense in depth: confirm the resolved path is still inside chatDir even after
-	// sanitization above.
+	// Defense in depth: confirm the resolved path is still inside chatDir. (Given the
+	// sanitization above, filename can no longer contain a separator or be "..", so
+	// this should always hold - it's a backstop against that invariant breaking later,
+	// not the primary protection.)
 	absChatDir, err := filepath.Abs(chatDir)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to resolve chat directory: %v", err)
 	}
-	if absPath != filepath.Join(absChatDir, filename) {
+	if !strings.HasPrefix(absPath, absChatDir+string(filepath.Separator)) {
 		return false, "", "", "", fmt.Errorf("invalid media filename")
 	}
 
@@ -697,6 +714,48 @@ func extractDirectPathFromURL(url string) string {
 
 	// Create proper direct path format
 	return "/" + pathPart
+}
+
+// isBlockedStorePath reports whether path resolves to one of the bridge's own
+// top-level files under store/ (the session/message SQLite databases and the API
+// token) rather than a per-chat subdirectory. Resolves symlinks on both sides so a
+// symlinked media_path (or a symlinked store/) can't be used to route around it.
+func isBlockedStorePath(path string) (bool, error) {
+	storeAbs, err := filepath.Abs("store")
+	if err != nil {
+		return false, err
+	}
+	storeReal, err := filepath.EvalSymlinks(storeAbs)
+	if err != nil {
+		// store/ not resolvable (e.g. doesn't exist yet) - fall back to the
+		// unresolved absolute path rather than skipping the check.
+		storeReal = storeAbs
+	}
+
+	pathAbs, err := filepath.Abs(path)
+	if err != nil {
+		return false, err
+	}
+	pathReal, err := filepath.EvalSymlinks(pathAbs)
+	if err != nil {
+		pathReal = pathAbs
+	}
+
+	if pathReal == storeReal {
+		return true, nil
+	}
+	if !strings.HasPrefix(pathReal, storeReal+string(filepath.Separator)) {
+		return false, nil
+	}
+
+	rel, err := filepath.Rel(storeReal, pathReal)
+	if err != nil {
+		return true, nil // fail safe: can't establish the relation, block it
+	}
+	// Only top-level children of store/ are sensitive (whatsapp.db, messages.db,
+	// api_token.txt, plus SQLite -wal/-shm sidecars). Per-chat media lives one
+	// level deeper (store/<chat>/<file>) and is fine to re-send.
+	return !strings.Contains(rel, string(filepath.Separator)), nil
 }
 
 // loadOrCreateAPIToken returns the shared secret required to call the REST API.
@@ -866,7 +925,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	}
 	serverAddr := fmt.Sprintf("%s:%d", host, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
-	fmt.Printf("REST API auth token (set WHATSAPP_BRIDGE_TOKEN to override, also saved to store/api_token.txt): %s\n", token)
+	// Don't print the token itself - stdout here is exactly what people redirect to
+	// whatsapp.log (see the README's own troubleshooting section), which would leak
+	// it into a file that then needs the same protection as the token file itself.
+	// The Python MCP server reads store/api_token.txt automatically; only cat it
+	// yourself if you need to copy it to WHATSAPP_BRIDGE_TOKEN on another machine.
+	fmt.Println("REST API auth token loaded (see store/api_token.txt; set WHATSAPP_BRIDGE_TOKEN to override)")
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
