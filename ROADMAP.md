@@ -107,6 +107,14 @@ currently carries.
 Revisit only if: whatsmeow gains native call support, or someone does a real independent
 audit of the `hypermeow`/`polymorfa` fork diff. Neither looks close as of this writing.
 
+**Update 2026-09-27:** patched the two concrete findings in a fork
+(`Vignesh-Thangamariappan/meowcaller`, branch `security-hardening`, not pushed yet):
+bumped `pion/dtls/v3` past its CVE, and added `recover()` to every goroutine that
+parses peer/relay-controlled data, so a malformed packet from a call peer no longer
+crashes the whole process. Tests and `govulncheck` confirm both. This does not change
+the go/no-go: the unaudited `hypermeow`/`polymorfa` diff underneath it is exactly as
+unreviewed as before, and that's still what blocks actually integrating calling.
+
 ## P2: community fixes worth reviewing before writing your own
 
 Upstream has 20+ open PRs (see issue #220). A few line up directly with gaps this audit
