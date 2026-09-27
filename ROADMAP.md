@@ -8,16 +8,18 @@ move fast.
 
 ## P0: will likely block you before you get this working at all
 
-- **Pinned `whatsmeow` is stale enough that WhatsApp may reject the connection outright.**
-  `go.mod` pins `go.mau.fi/whatsmeow@v0.0.0-20250318233852` (2025-03-18). As of this
-  writing, upstream has a wave of open PRs all fixing the same "client outdated (405)"
-  connect failure by bumping this dependency: #363, #355, #352, #348, #318, #308, #302,
-  #299, #296, #274, #272, among others, several from this week. WhatsApp evidently keeps
-  moving the minimum accepted client version, so a pin from March 2025 is a real risk to
-  pairing a real account today. Fixing this means bumping `whatsmeow` *and* threading
-  `context.Context` through the call sites that now require it (upstream's API changed
-  shape; see issue #104 and PR #363/#355 for what that migration looks like). Try
-  connecting first; if you hit a 405, this is why.
+- ~~**Pinned `whatsmeow` is stale enough that WhatsApp may reject the connection
+  outright.**~~ **Fixed 2026-09-27.** This wasn't hypothetical: the first real pairing
+  attempt against this fork hit exactly this, `Client outdated (405) connect failure`,
+  before a QR code ever rendered. Bumped `go.mau.fi/whatsmeow` from the
+  `v0.0.0-20250318233852` (2025-03-18) pin to its `v0.0.0-20260925162019` snapshot and
+  threaded `context.Context` through the five call sites the new API requires it on
+  (`client.Download`, `sqlstore.New`, `container.GetFirstDevice`, `client.GetGroupInfo`,
+  `Store.Contacts.GetContact`). As a side effect this also pulled in current
+  `golang.org/x/net` and swapped `gorilla/websocket` for `coder/websocket`, which closes
+  the two Go module CVEs in the P1 section below. If pairing still 405s after pulling
+  this commit, WhatsApp has moved the goalposts again since 2026-09-27; re-run
+  `go get go.mau.fi/whatsmeow@latest` and rebuild.
 - **Media downloads may 403.** A large cluster of PRs (#361, #354, #353, #352, #351, #347,
   #324, #320, #307, #298, #273) all fix `download_media` returning 403 by capturing
   `direct_path` from the incoming message's protobuf at receive time, instead of this
@@ -36,11 +38,12 @@ move fast.
   shapes, per community reports on upstream issue #215's discussion. Bumping `mcp` needs
   converting those dataclasses to Pydantic models (or plain dicts) and testing every
   tool call end to end, not just editing `pyproject.toml`.
-- **Go side: two real, reachable CVEs**, per `govulncheck` against this fork's call
-  paths: `github.com/gorilla/websocket` 1.5.0 (weak PRNG for the WebSocket mask key, fix:
-  1.5.3) and `golang.org/x/net` 0.37.0 (two CVEs, fixes in 0.53.0 and 0.55.0). Everything
-  else `govulncheck` reports is a Go standard-library/toolchain CVE fixed in a later Go
-  patch (1.26.3 through 1.26.6): that's a "keep your Go toolchain updated" note, not a
+- ~~**Go side: two real, reachable CVEs**~~ **Fixed 2026-09-27**, as a side effect of the
+  `whatsmeow` bump above: `github.com/gorilla/websocket` 1.5.0 (weak PRNG for the
+  WebSocket mask key) is gone from the dependency graph (whatsmeow now uses
+  `coder/websocket`), and `golang.org/x/net` came along to 0.59.0. Re-ran `govulncheck`
+  after the bump: only Go standard-library/toolchain CVEs remain, fixed in later Go
+  patches (1.26.3 through 1.26.6). That's a "keep your Go toolchain updated" note, not a
   `go.mod` change.
 
 ## P2: community fixes worth reviewing before writing your own
