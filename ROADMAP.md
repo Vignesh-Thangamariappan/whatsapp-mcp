@@ -75,6 +75,38 @@ needed, nothing found is both reachable and unfixable in the bridge's own code.
   handshake verifies the server cert, no plaintext content or key material in default
   log levels.
 
+## Calling (researched 2026-09-27, not pursued)
+
+Explored adding real outbound/inbound voice calling on top of this fork. Short version:
+there's no good path right now without a much bigger trust surface than this fork
+currently carries.
+
+- **`meowcaller`** (github.com/purpshell/meowcaller) is the only serious candidate for a
+  personal (non-Business-API) account, since it attaches directly to a `whatsmeow.Client`.
+  But its README's "no fork needed" claim only covers its experimental group-call
+  surface. The actual calling engine imports `github.com/polymorfa/hypermeow`, a fork of
+  `tulir/whatsmeow` kept under the same package name so it type-checks as a drop-in, plus
+  a forked `libsignal-protocol-go`. Both forks are maintained by the same one person as
+  meowcaller itself (real identity, not anonymous, decent track record), but adopting
+  meowcaller for real means abandoning the upstream `whatsmeow` this fork just audited
+  and upgraded, for a 39k-line combined diff nobody's independently reviewed. Concrete
+  issues found even in the parts that were reviewed: a real CVE in a pinned dependency
+  (`pion/dtls/v3` GO-2026-6165, panic on a crafted handshake, fixed in v3.1.4), and no
+  panic recovery anywhere in the peer-controlled packet parsing (RTP/SRTP/MLow codec),
+  the same bug class as the whatsmeow finding above, meaning a malicious call peer could
+  crash the bridge.
+- **whatsapp-web.js** doesn't actually have shipped call support. What looked like "call
+  support" is a single external contributor's unmerged, unreviewed pull request, not in
+  any release. The library itself is fine and well-maintained, but there's nothing to
+  switch to here yet, and switching would also mean trading the native Go bridge for a
+  full Puppeteer/Chromium instance.
+- Meta's official WhatsApp Business Calling API is real and mature, but it's tied to a
+  Business Platform number, not a personal linked-device account like this fork uses, so
+  it doesn't apply here.
+
+Revisit only if: whatsmeow gains native call support, or someone does a real independent
+audit of the `hypermeow`/`polymorfa` fork diff. Neither looks close as of this writing.
+
 ## P2: community fixes worth reviewing before writing your own
 
 Upstream has 20+ open PRs (see issue #220). A few line up directly with gaps this audit
