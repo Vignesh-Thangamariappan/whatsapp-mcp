@@ -12,7 +12,10 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    place_call as whatsapp_place_call,
+    hangup_call as whatsapp_hangup_call,
+    call_converse as whatsapp_call_converse
 )
 
 # Initialize FastMCP server
@@ -201,6 +204,98 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     return {
         "success": success,
         "message": status_message
+    }
+
+@mcp.tool()
+def place_call(recipient: str) -> Dict[str, Any]:
+    """Place an outbound WhatsApp voice call to a person. This rings the
+    recipient's phone; it does not send or receive any audio from this side, so it
+    is a signaling-only call placement, not a way to actually talk. It never
+    auto-answers or auto-records anything - there is no incoming-call handling at
+    all in this bridge.
+
+    Args:
+        recipient: The recipient - either a phone number with country code but no + or other symbols,
+                 or a JID (e.g., "123456789@s.whatsapp.net")
+
+    Returns:
+        A dictionary containing success status, a status message, and (on success) a call_id
+        that can be passed to hangup_call.
+    """
+    if not recipient:
+        return {
+            "success": False,
+            "message": "Recipient must be provided"
+        }
+
+    success, status_message, call_id = whatsapp_place_call(recipient)
+    return {
+        "success": success,
+        "message": status_message,
+        "call_id": call_id
+    }
+
+@mcp.tool()
+def hangup_call(call_id: str) -> Dict[str, Any]:
+    """End a call previously placed with place_call.
+
+    Args:
+        call_id: The call_id returned by place_call
+
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    if not call_id:
+        return {
+            "success": False,
+            "message": "call_id must be provided"
+        }
+
+    success, status_message = whatsapp_hangup_call(call_id)
+    return {
+        "success": success,
+        "message": status_message
+    }
+
+@mcp.tool()
+def call_converse(call_id: str, message: str) -> Dict[str, Any]:
+    """Speak a message on a live call placed with place_call, and get back the
+    peer's transcribed spoken reply. Call this repeatedly, once per conversational
+    turn, choosing what to say next based on the previous reply - this tool does
+    not decide what to say, you do.
+
+    Waits for the call to be answered if needed, plays the message through a local
+    text-to-speech voice, then listens until the person stops talking (or about 30
+    seconds), and transcribes their reply with a local speech-to-text model. A
+    single call can take up to roughly two minutes - this is a real phone
+    conversation happening in real time, not an instant request.
+
+    Args:
+        call_id: The call_id returned by place_call
+        message: What to say on this turn
+
+    Returns:
+        A dictionary containing success status, a status message, and the peer's
+        transcribed reply (empty if they didn't say anything audible)
+    """
+    if not call_id:
+        return {
+            "success": False,
+            "message": "call_id must be provided",
+            "reply": ""
+        }
+    if not message:
+        return {
+            "success": False,
+            "message": "message must be provided",
+            "reply": ""
+        }
+
+    success, status_message, reply = whatsapp_call_converse(call_id, message)
+    return {
+        "success": success,
+        "message": status_message,
+        "reply": reply
     }
 
 @mcp.tool()

@@ -9,14 +9,18 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,12 +29,14 @@ import (
 
 	"bytes"
 
-	"go.mau.fi/whatsmeow"
-	waProto "go.mau.fi/whatsmeow/binary/proto"
-	"go.mau.fi/whatsmeow/store/sqlstore"
-	"go.mau.fi/whatsmeow/types"
-	"go.mau.fi/whatsmeow/types/events"
-	waLog "go.mau.fi/whatsmeow/util/log"
+	"github.com/purpshell/meowcaller"
+
+	"github.com/polymorfa/hypermeow"
+	waProto "github.com/polymorfa/hypermeow/binary/proto"
+	"github.com/polymorfa/hypermeow/store/sqlstore"
+	"github.com/polymorfa/hypermeow/types"
+	"github.com/polymorfa/hypermeow/types/events"
+	waLog "github.com/polymorfa/hypermeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -387,6 +393,428 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+// PlaceCallRequest represents the request body for the place call API
+type PlaceCallRequest struct {
+	Recipient string `json:"recipient"`
+}
+
+// PlaceCallResponse represents the response for the place call API
+type PlaceCallResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	CallID  string `json:"call_id,omitempty"`
+}
+
+// HangupCallRequest represents the request body for the hangup call API
+type HangupCallRequest struct {
+	CallID string `json:"call_id"`
+}
+
+// ConverseRequest represents the request body for the call converse API
+type ConverseRequest struct {
+	CallID  string `json:"call_id"`
+	Message string `json:"message"`
+}
+
+// ConverseResponse represents the response for the call converse API
+type ConverseResponse struct {
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Reply   string `json:"reply,omitempty"`
+}
+
+// trackedCall pairs a placed call with a channel that closes once the peer answers
+// and media starts flowing (mirrors Call.OnReady, which only supports one callback -
+// CallManager owns that slot so callConverse doesn't have to fight over it turn by
+// turn).
+type trackedCall struct {
+	call  *meowcaller.Call
+	ready chan struct{}
+}
+
+// CallManager tracks calls this bridge has placed, keyed by meowcaller's call ID,
+// so later /api/call/hangup and /api/call/converse requests can find the live
+// *meowcaller.Call. Entries remove themselves once the call ends (answered,
+// rejected, or timed out).
+type CallManager struct {
+	mu    sync.Mutex
+	calls map[string]*trackedCall
+}
+
+// NewCallManager returns an empty CallManager.
+func NewCallManager() *CallManager {
+	return &CallManager{calls: make(map[string]*trackedCall)}
+}
+
+// Track registers a newly placed call and removes it once it ends.
+func (m *CallManager) Track(call *meowcaller.Call) {
+	entry := &trackedCall{call: call, ready: make(chan struct{})}
+
+	m.mu.Lock()
+	m.calls[call.ID()] = entry
+	m.mu.Unlock()
+
+	call.OnReady(func() {
+		close(entry.ready)
+	})
+
+	call.OnEnd(func(reason string) {
+		m.mu.Lock()
+		delete(m.calls, call.ID())
+		m.mu.Unlock()
+		fmt.Printf("Call %s ended: %s\n", call.ID(), reason)
+	})
+}
+
+// Get looks up a tracked call by ID, along with its ready channel (closed once the
+// peer has answered and media is flowing).
+func (m *CallManager) Get(callID string) (call *meowcaller.Call, ready chan struct{}, ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	entry, ok := m.calls[callID]
+	if !ok {
+		return nil, nil, false
+	}
+	return entry.call, entry.ready, true
+}
+
+// isAllowedCallTarget reports whether recipient may be called. If
+// WHATSAPP_CALL_ALLOWLIST is unset, every recipient is allowed (matching
+// send_message's existing trust model). If set, it's a comma-separated list of
+// phone numbers/JIDs and recipient must match one of them (bare-number comparison,
+// so "919952743202" matches "919952743202@s.whatsapp.net"). This exists because
+// call_converse lets a call actually talk, which turns the pre-existing "any
+// WhatsApp contact can prompt-inject the LLM" gap (ROADMAP.md, P3) from "send an
+// unwanted message" into "hold an AI-voiced conversation with an arbitrary number" -
+// worth a cheap extra gate specifically for calling.
+func isAllowedCallTarget(recipient string) bool {
+	allowlist := os.Getenv("WHATSAPP_CALL_ALLOWLIST")
+	if allowlist == "" {
+		return true
+	}
+	bareRecipient := strings.SplitN(recipient, "@", 2)[0]
+	for _, entry := range strings.Split(allowlist, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if entry == recipient || strings.SplitN(entry, "@", 2)[0] == bareRecipient {
+			return true
+		}
+	}
+	return false
+}
+
+// placeCall places an outbound 1:1 voice call. It only places the call (signaling)
+// itself; no audio is attached until a separate call_converse turn plays and
+// listens on it. Placing a call should never auto-answer or auto-record an
+// incoming one - that's a different, deliberately unimplemented code path.
+func placeCall(callClient *meowcaller.Client, calls *CallManager, recipient string) (bool, string, string) {
+	if callClient == nil {
+		return false, "Calling is not initialized", ""
+	}
+	if recipient == "" {
+		return false, "Recipient must be provided", ""
+	}
+	if !isAllowedCallTarget(recipient) {
+		return false, "Recipient is not on WHATSAPP_CALL_ALLOWLIST", ""
+	}
+
+	call, err := callClient.Call(context.Background(), recipient)
+	if err != nil {
+		return false, fmt.Sprintf("Error placing call: %v", err), ""
+	}
+
+	calls.Track(call)
+	fmt.Printf("Call placed to %s (call_id=%s)\n", recipient, call.ID())
+	return true, fmt.Sprintf("Call placed to %s", recipient), call.ID()
+}
+
+// hangupCall ends a call previously placed via placeCall, identified by its call ID.
+func hangupCall(calls *CallManager, callID string) (bool, string) {
+	if callID == "" {
+		return false, "call_id must be provided"
+	}
+
+	call, _, ok := calls.Get(callID)
+	if !ok {
+		return false, "Unknown or already-ended call ID"
+	}
+
+	if err := call.Hangup(); err != nil {
+		return false, fmt.Sprintf("Error hanging up call: %v", err)
+	}
+
+	return true, "Call ended"
+}
+
+// --- Speech in/out for call_converse, built on the local voice-mode stack already
+// running on this machine (Kokoro TTS, whisper.cpp STT) - no third-party network
+// egress, consistent with today's telemetry review.
+
+// synthesizeSpeech renders text to a 16-bit PCM WAV file via the local Kokoro TTS
+// server and returns its path. The caller is responsible for removing it.
+func synthesizeSpeech(text string) (string, error) {
+	ttsURL := os.Getenv("WHATSAPP_CALL_TTS_URL")
+	if ttsURL == "" {
+		ttsURL = "http://127.0.0.1:8880/v1/audio/speech"
+	}
+	voice := os.Getenv("WHATSAPP_CALL_TTS_VOICE")
+	if voice == "" {
+		voice = "af_heart"
+	}
+
+	reqBody, err := json.Marshal(map[string]any{
+		"model":           "kokoro",
+		"input":           text,
+		"voice":           voice,
+		"response_format": "wav",
+		"stream":          false,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode TTS request: %w", err)
+	}
+
+	resp, err := http.Post(ttsURL, "application/json", bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("TTS request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return "", fmt.Errorf("TTS server returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	outFile, err := os.CreateTemp("", "whatsapp-call-tts-*.wav")
+	if err != nil {
+		return "", fmt.Errorf("create TTS temp file: %w", err)
+	}
+	defer outFile.Close()
+	if _, err := io.Copy(outFile, resp.Body); err != nil {
+		os.Remove(outFile.Name())
+		return "", fmt.Errorf("save TTS audio: %w", err)
+	}
+
+	return outFile.Name(), nil
+}
+
+// transcribeAudio sends a WAV file to the local whisper.cpp server and returns its
+// transcript.
+func transcribeAudio(wavPath string) (string, error) {
+	sttURL := os.Getenv("WHATSAPP_CALL_STT_URL")
+	if sttURL == "" {
+		sttURL = "http://127.0.0.1:2022/v1/audio/transcriptions"
+	}
+
+	f, err := os.Open(wavPath)
+	if err != nil {
+		return "", fmt.Errorf("open recorded audio: %w", err)
+	}
+	defer f.Close()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", filepath.Base(wavPath))
+	if err != nil {
+		return "", fmt.Errorf("build STT request: %w", err)
+	}
+	if _, err := io.Copy(part, f); err != nil {
+		return "", fmt.Errorf("attach recorded audio: %w", err)
+	}
+	if err := writer.Close(); err != nil {
+		return "", fmt.Errorf("finalize STT request: %w", err)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, sttURL, &body)
+	if err != nil {
+		return "", fmt.Errorf("build STT request: %w", err)
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("STT request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Text  string `json:"text"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("parse STT response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK || result.Error != "" {
+		return "", fmt.Errorf("STT server error: %s", result.Error)
+	}
+
+	return strings.TrimSpace(result.Text), nil
+}
+
+// vadEnergyThreshold is the RMS level (on [-1,1) float32 samples) above which a
+// frame counts as speech rather than silence/background. Not empirically tuned yet
+// against a real call - the first live test is exactly what tunes it.
+const vadEnergyThreshold = 0.02
+
+// silenceFramesToEndTurn is how many consecutive silent 60ms frames (after speech
+// has started) count as "the peer stopped talking". 14 frames is ~840ms.
+const silenceFramesToEndTurn = 14
+
+// maxTurnFrames caps a single listen turn regardless of VAD, so a stuck/silent line
+// can't hang call_converse forever. 500 frames is ~30s.
+const maxTurnFrames = 500
+
+// rmsEnergy returns the root-mean-square amplitude of a mono float32 frame.
+func rmsEnergy(frame []float32) float64 {
+	if len(frame) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, s := range frame {
+		sum += float64(s) * float64(s)
+	}
+	return math.Sqrt(sum / float64(len(frame)))
+}
+
+// endpointRecorder wraps a meowcaller.AudioSink (normally a WAVRecorder) with a
+// simple energy-based endpointer: it signals done once the peer has spoken and then
+// gone quiet for silenceFramesToEndTurn frames, or once maxTurnFrames is reached
+// regardless. This is a deliberately simple VAD, not full noise-robust endpointing.
+type endpointRecorder struct {
+	mu          sync.Mutex
+	inner       meowcaller.AudioSink
+	started     bool
+	silenceRun  int
+	totalFrames int
+	done        chan struct{}
+	closed      bool
+}
+
+func newEndpointRecorder(inner meowcaller.AudioSink) *endpointRecorder {
+	return &endpointRecorder{inner: inner, done: make(chan struct{})}
+}
+
+func (l *endpointRecorder) WriteFrame(frame []float32) error {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+
+	energy := rmsEnergy(frame)
+	if energy > vadEnergyThreshold {
+		l.started = true
+		l.silenceRun = 0
+	} else if l.started {
+		l.silenceRun++
+	}
+	l.totalFrames++
+	shouldFinish := (l.started && l.silenceRun >= silenceFramesToEndTurn) || l.totalFrames >= maxTurnFrames
+	l.mu.Unlock()
+
+	if err := l.inner.WriteFrame(frame); err != nil {
+		return err
+	}
+
+	if shouldFinish {
+		l.signalDone()
+	}
+	return nil
+}
+
+func (l *endpointRecorder) signalDone() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.closed {
+		l.closed = true
+		close(l.done)
+	}
+}
+
+// Close satisfies AudioSink; it does not close the underlying recorder (the caller
+// does that explicitly after the turn ends, so the WAV header gets finalized once).
+func (l *endpointRecorder) Close() error { return nil }
+
+// wait blocks until end-of-turn (VAD-detected silence, the frame cap, or ctx being
+// done), whichever comes first.
+func (l *endpointRecorder) wait(ctx context.Context, timeout time.Duration) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-l.done:
+	case <-timer.C:
+		l.signalDone()
+	case <-ctx.Done():
+		l.signalDone()
+	}
+}
+
+// converseOnCall plays message to an already-placed call, then listens for and
+// transcribes the peer's spoken reply. It waits for the call to actually be
+// answered (media flowing) before playing anything, so a turn placed the instant
+// after place_call returns doesn't talk into a still-ringing line.
+func converseOnCall(calls *CallManager, callID, message string) (success bool, status string, reply string) {
+	if callID == "" {
+		return false, "call_id must be provided", ""
+	}
+	if message == "" {
+		return false, "message must be provided", ""
+	}
+
+	call, ready, ok := calls.Get(callID)
+	if !ok {
+		return false, "Unknown or already-ended call ID", ""
+	}
+
+	select {
+	case <-ready:
+	case <-time.After(45 * time.Second):
+		return false, "Timed out waiting for the call to be answered", ""
+	}
+
+	wavPath, err := synthesizeSpeech(message)
+	if err != nil {
+		return false, fmt.Sprintf("Speech synthesis failed: %v", err), ""
+	}
+	defer os.Remove(wavPath)
+
+	src, err := meowcaller.WAVFile(wavPath)
+	if err != nil {
+		return false, fmt.Sprintf("Failed to load synthesized audio: %v", err), ""
+	}
+
+	recordPath := filepath.Join(os.TempDir(), "whatsapp-call-"+callID+"-"+strconv.FormatInt(time.Now().UnixNano(), 10)+".wav")
+	rawRecorder, err := meowcaller.WAVRecorder(recordPath)
+	if err != nil {
+		return false, fmt.Sprintf("Failed to open recorder: %v", err), ""
+	}
+	listener := newEndpointRecorder(rawRecorder)
+	call.Receive(listener)
+
+	player := call.Play(src)
+	playFinished := make(chan struct{})
+	player.OnFinish(func() { close(playFinished) })
+
+	// Give the peer a moment to hear the message before we start counting silence
+	// against them - otherwise the gap between "message finishes" and "person starts
+	// talking" can itself trip the end-of-turn silence threshold.
+	select {
+	case <-playFinished:
+	case <-time.After(30 * time.Second):
+	}
+
+	listener.wait(context.Background(), 30*time.Second)
+	rawRecorder.Close()
+	defer os.Remove(recordPath)
+
+	transcript, err := transcribeAudio(recordPath)
+	if err != nil {
+		return false, fmt.Sprintf("Transcription failed: %v", err), ""
+	}
+
+	return true, "ok", transcript
 }
 
 // Extract media info from a message
@@ -794,7 +1222,7 @@ func loadOrCreateAPIToken() (string, error) {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, callClient *meowcaller.Client, calls *CallManager, port int) {
 	token, err := loadOrCreateAPIToken()
 	if err != nil {
 		fmt.Printf("Failed to set up REST API authentication: %v\n", err)
@@ -915,6 +1343,112 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	}))
 
+	// Handler for placing an outbound call. Same auth gating as everything else on
+	// this server - a call is a real, immediate effect on the recipient's phone, so
+	// it gets no more (and no less) trust than /api/send.
+	http.HandleFunc("/api/call", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req PlaceCallRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.Recipient == "" {
+			http.Error(w, "Recipient is required", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Printf("Received request to place a call to %s\n", req.Recipient)
+
+		success, message, callID := placeCall(callClient, calls, req.Recipient)
+		fmt.Println("Call placed", success)
+
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		json.NewEncoder(w).Encode(PlaceCallResponse{
+			Success: success,
+			Message: message,
+			CallID:  callID,
+		})
+	}))
+
+	// Handler for hanging up a call this bridge placed.
+	http.HandleFunc("/api/call/hangup", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req HangupCallRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.CallID == "" {
+			http.Error(w, "call_id is required", http.StatusBadRequest)
+			return
+		}
+
+		success, message := hangupCall(calls, req.CallID)
+
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: success,
+			Message: message,
+		})
+	}))
+
+	// Handler for speaking a message on an already-placed call and returning the
+	// peer's transcribed spoken reply. This is a slow endpoint by nature (it waits
+	// for the call to be answered, plays audio, then listens for a real person to
+	// finish talking), so give it generous timeouts on the client side.
+	http.HandleFunc("/api/call/converse", requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req ConverseRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.CallID == "" || req.Message == "" {
+			http.Error(w, "call_id and message are required", http.StatusBadRequest)
+			return
+		}
+
+		fmt.Printf("Speaking on call %s: %q\n", req.CallID, req.Message)
+
+		success, message, reply := converseOnCall(calls, req.CallID, req.Message)
+		fmt.Printf("Converse turn on call %s: success=%v reply=%q\n", req.CallID, success, reply)
+
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+
+		json.NewEncoder(w).Encode(ConverseResponse{
+			Success: success,
+			Message: message,
+			Reply:   reply,
+		})
+	}))
+
 	// Start the server. Binds to 127.0.0.1 by default - the API previously bound to
 	// all interfaces (":8080"), so anyone on the same LAN/Wi-Fi could reach it.
 	// Override with WHATSAPP_BRIDGE_HOST if you deliberately want to expose it
@@ -988,6 +1522,14 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Wrap the client with meowcaller's managed calling API. This must happen before
+	// client.Connect() below so the call-signaling event handlers are installed
+	// before the receive loop starts. No incoming-call handling is wired up here:
+	// this bridge only places outbound calls, it never auto-answers or auto-records
+	// an inbound one.
+	callClient := meowcaller.NewClient(client)
+	callManager := NewCallManager()
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
@@ -1060,7 +1602,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, callClient, callManager, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

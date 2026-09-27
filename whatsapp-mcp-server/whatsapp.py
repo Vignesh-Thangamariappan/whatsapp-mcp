@@ -662,20 +662,104 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
         }
         
         response = requests.post(url, json=payload, headers=_auth_headers())
-        
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
         return False, f"Error parsing response: {response.text}"
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
+
+def place_call(recipient: str) -> Tuple[bool, str, Optional[str]]:
+    """Place an outbound WhatsApp voice call. This only places the call (rings the
+    recipient's phone); it does not attach any audio on this side, and it never
+    auto-answers or auto-records an incoming call - there is no such thing as an
+    incoming call handler here at all."""
+    try:
+        if not recipient:
+            return False, "Recipient must be provided", None
+
+        url = f"{WHATSAPP_API_BASE_URL}/call"
+        payload = {"recipient": recipient}
+
+        response = requests.post(url, json=payload, headers=_auth_headers())
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response"), result.get("call_id")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}", None
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
+def hangup_call(call_id: str) -> Tuple[bool, str]:
+    """End a call previously placed with place_call."""
+    try:
+        if not call_id:
+            return False, "call_id must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/call/hangup"
+        payload = {"call_id": call_id}
+
+        response = requests.post(url, json=payload, headers=_auth_headers())
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def call_converse(call_id: str, message: str) -> Tuple[bool, str, str]:
+    """Speak message on a live call and return the peer's transcribed spoken reply.
+    Waits for the call to be answered if it hasn't been yet, then plays the message
+    (synthesized locally via Kokoro) and listens until the peer stops talking (or a
+    ~30s cap), transcribing their reply locally via whisper.cpp. Can take up to
+    roughly two minutes for a single turn - this is a live phone conversation, not
+    an instant API call."""
+    try:
+        if not call_id:
+            return False, "call_id must be provided", ""
+        if not message:
+            return False, "message must be provided", ""
+
+        url = f"{WHATSAPP_API_BASE_URL}/call/converse"
+        payload = {"call_id": call_id, "message": message}
+
+        # This endpoint can legitimately take ~100s+ (waiting for answer, playing
+        # the message, then listening for a real person to finish speaking).
+        response = requests.post(url, json=payload, headers=_auth_headers(), timeout=150)
+
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response"), result.get("reply", "")
+        else:
+            return False, f"Error: HTTP {response.status_code} - {response.text}", ""
+
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", ""
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}", ""
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", ""
 
 def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
     try:
