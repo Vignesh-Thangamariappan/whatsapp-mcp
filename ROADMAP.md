@@ -46,6 +46,35 @@ move fast.
   patches (1.26.3 through 1.26.6). That's a "keep your Go toolchain updated" note, not a
   `go.mod` change.
 
+## whatsmeow library audit (2026-09-27)
+
+Separately from the bridge/server code above, audited the `whatsmeow` dependency itself
+(pinned commit `b3832c2bd1d1`) for issues that would justify forking it. Verdict: no fork
+needed, nothing found is both reachable and unfixable in the bridge's own code.
+
+- **No `recover()` around whatsmeow's internal per-stanza dispatch** (`client.go:925`,
+  including the message-decrypt path). A malformed/unusual incoming message can panic
+  and crash the whole bridge process, not just a goroutine. Reachable by any WhatsApp
+  contact who messages the account. Five closed upstream issues are this exact pattern,
+  each patched individually after being hit, never fixed structurally. Filed upstream as
+  [tulir/whatsmeow#1272](https://github.com/tulir/whatsmeow/issues/1272) (no
+  SECURITY.md or private reporting on that repo, so filed publicly as a hardening
+  request rather than privately).
+- Mitigated on our side with a process supervisor (macOS `launchd` job, restart-on-crash
+  only, not on clean exit) so a whatsmeow-triggered crash reconnects automatically
+  instead of silently leaving the bridge down. Setup hit an unrelated macOS Gatekeeper
+  snag (an unsigned local Go binary launched via `launchd` hangs at `dyld` startup even
+  though it runs fine from a terminal); fix is `sudo spctl --add <path to binary>`, a
+  narrow per-binary allow-rule, not a general Gatekeeper bypass.
+- Two lower-severity unbounded-read spots (`download.go` media downloads,
+  `binary/unpack.go` frame decompression): theoretical memory-exhaustion DoS, bounded in
+  practice by WhatsApp's own server-side size limits.
+- Confirmed clean: no SSRF in media download (URL is always server-derived from an
+  authenticated host list; peer-supplied `direct_path` is only ever a URL path fragment,
+  never a host), MAC-then-decrypt ordering is correct, no `InsecureSkipVerify`, Noise
+  handshake verifies the server cert, no plaintext content or key material in default
+  log levels.
+
 ## P2: community fixes worth reviewing before writing your own
 
 Upstream has 20+ open PRs (see issue #220). A few line up directly with gaps this audit
@@ -56,7 +85,13 @@ found or with everyday usability:
   prompt-inject you," which the audit flagged as unresolved by design.
 - **#346 (stdio hygiene)** stops stray diagnostic prints from corrupting the MCP's stdio
   channel, and fixes `list_chats` returning empty with `include_last_message=False`.
-  Worth a look since this fork also touched logging output.
+  Worth a look since this fork also touched logging output. Related but distinct gap
+  observed directly on a real account: `list_chats`/`list_messages` do return data, but
+  chats keyed by a `@lid` JID (newer WhatsApp accounts) come back with a numeric ID as
+  the `name` and a null `last_message`, i.e. reads work but contact-name resolution is
+  degraded for LID-based contacts. Same root cause as the media-403 cluster below (LID
+  is a newer WhatsApp identifier scheme this fork's JID/contact handling doesn't fully
+  resolve yet).
 - **#281 / #279 (FTS5 search + SQLite indexes)**: real perf wins on `list_messages`
   search once your message history grows.
 - **#342 / #328 / #316 (document MIME type + filename fixes)**: documents currently
