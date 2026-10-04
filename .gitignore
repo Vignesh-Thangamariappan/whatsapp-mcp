@@ -5,3 +5,5 @@ whatsapp-bridge/whatsapp-client
 whatsapp-bridge/whatsapp-bridge
 whatsapp-bridge/store/api_token.txt
 whatsapp-bridge/store/bridge.log
+dist/
+*.exe
