@@ -1172,6 +1172,19 @@ func isBlockedStorePath(path string) (bool, error) {
 	if pathReal == storeReal {
 		return true, nil
 	}
+
+	// Compare by file identity too. The string checks below assume Unix path
+	// semantics; on Windows, alternate spellings of the same file (\\?\C:\..., \\.\C:\...,
+	// UNC admin shares) don't share storeReal's prefix, so they would slip past.
+	if storeInfo, err := os.Stat(storeReal); err == nil {
+		if info, err := os.Stat(pathReal); err == nil && os.SameFile(info, storeInfo) {
+			return true, nil
+		}
+		if parent, err := os.Stat(filepath.Dir(pathReal)); err == nil && os.SameFile(parent, storeInfo) {
+			return true, nil // top-level child of store/
+		}
+	}
+
 	if !strings.HasPrefix(pathReal, storeReal+string(filepath.Separator)) {
 		return false, nil
 	}
