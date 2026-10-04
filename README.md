@@ -103,6 +103,8 @@ See [ROADMAP.md](./ROADMAP.md) for what's next, including a connection-breaking 
 
 ### Windows (x64)
 
+Short on time, or pointing Claude Code at it? Give it [`WINDOWS_SETUP.md`](WINDOWS_SETUP.md), a step-by-step guide written for an agent.
+
 The bridge uses the pure-Go `modernc.org/sqlite` driver, so it needs **no CGO, no C compiler and no Go toolchain on the Windows machine**. Build the exe elsewhere and copy it over:
 
 1. On any machine with Go: `bash windows/build.sh` produces `dist/whatsapp-bridge.exe`.
