@@ -101,27 +101,19 @@ See [ROADMAP.md](./ROADMAP.md) for what's next, including a connection-breaking 
 
    Or restart Cursor.
 
-### Windows Compatibility
+### Windows (x64)
 
-If you're running this project on Windows, be aware that `go-sqlite3` requires **CGO to be enabled** in order to compile and work properly. By default, **CGO is disabled on Windows**, so you need to explicitly enable it and have a C compiler installed.
+Short on time, or pointing Claude Code at it? Give it [`WINDOWS_SETUP.md`](WINDOWS_SETUP.md), a step-by-step guide written for an agent.
 
-#### Steps to get it working:
+The bridge uses the pure-Go `modernc.org/sqlite` driver, so it needs **no CGO, no C compiler and no Go toolchain on the Windows machine**. Build the exe elsewhere and copy it over:
 
-1. **Install a C compiler**  
-   We recommend using [MSYS2](https://www.msys2.org/) to install a C compiler for Windows. After installing MSYS2, make sure to add the `ucrt64\bin` folder to your `PATH`.  
-   → A step-by-step guide is available [here](https://code.visualstudio.com/docs/cpp/config-mingw).
+1. On any machine with Go: `bash windows/build.sh` produces `dist/whatsapp-bridge.exe`.
+2. Copy the repo to the Windows machine and put the exe at `whatsapp-bridge\whatsapp-bridge.exe`.
+3. Install [`uv`](https://docs.astral.sh/uv/) and the Claude Code CLI, then run `powershell -ExecutionPolicy Bypass -File windows\install.ps1`. This sets up the Python server and registers the MCP.
+4. Pair once from a visible terminal: `cd whatsapp-bridge; .\whatsapp-bridge.exe`, scan the QR code, then Ctrl+C.
+5. Run `windows\install.ps1 -RegisterTask` to start the bridge hidden at every logon (idles around 12 MB, heap capped with `GOMEMLIMIT`).
 
-2. **Enable CGO and run the app**
-
-   ```bash
-   cd whatsapp-bridge
-   go env -w CGO_ENABLED=1
-   go run main.go
-   ```
-
-Without this setup, you'll likely run into errors like:
-
-> `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
+ffmpeg is only needed for `send_audio_message`; skip it otherwise. Each machine is its own linked device and needs its own QR pairing. Do not copy `store\whatsapp.db` between machines.
 
 ## Architecture Overview
 

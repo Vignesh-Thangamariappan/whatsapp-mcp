@@ -24,7 +24,7 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 	"github.com/mdp/qrterminal"
 
 	"bytes"
@@ -63,7 +63,7 @@ func NewMessageStore() (*MessageStore, error) {
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite", "file:store/messages.db?_pragma=foreign_keys(1)")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -370,7 +370,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(filepath.Base(mediaPath)),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
@@ -1172,6 +1172,19 @@ func isBlockedStorePath(path string) (bool, error) {
 	if pathReal == storeReal {
 		return true, nil
 	}
+
+	// Compare by file identity too. The string checks below assume Unix path
+	// semantics; on Windows, alternate spellings of the same file (\\?\C:\..., \\.\C:\...,
+	// UNC admin shares) don't share storeReal's prefix, so they would slip past.
+	if storeInfo, err := os.Stat(storeReal); err == nil {
+		if info, err := os.Stat(pathReal); err == nil && os.SameFile(info, storeInfo) {
+			return true, nil
+		}
+		if parent, err := os.Stat(filepath.Dir(pathReal)); err == nil && os.SameFile(parent, storeInfo) {
+			return true, nil // top-level child of store/
+		}
+	}
+
 	if !strings.HasPrefix(pathReal, storeReal+string(filepath.Separator)) {
 		return false, nil
 	}
@@ -1488,7 +1501,7 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite", "file:store/whatsapp.db?_pragma=foreign_keys(1)", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
